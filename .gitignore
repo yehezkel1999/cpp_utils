@@ -1,0 +1,11 @@
+
+# object files
+obj/
+*.o
+*.obj
+
+*.so
+*.a
+
+# executalbles
+*.exe
