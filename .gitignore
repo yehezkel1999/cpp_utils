@@ -1,9 +1,15 @@
 
+# files with no extentions
+*
+!*.*
+!/**/
+
 # object files
 obj/
 *.o
 *.obj
 
+#shared object files
 *.so
 *.a
 
