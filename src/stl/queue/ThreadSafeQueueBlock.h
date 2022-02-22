@@ -5,8 +5,14 @@
 #include <memory>
 #include <stdexcept>
 
+#include <thread>
+#include <chrono>
+
 namespace utils {
     
+    template <typename T>
+    class ThreadSafeQueue;
+
     template <typename T>
     class ThreadSafeQueueBlock {
     public: // usings
@@ -23,15 +29,8 @@ namespace utils {
         ThreadSafeQueueBlock(size_type capacity);
         
         void clear();
-        size_type checkAndAdd();
-
-    public: // public methods
-        ThreadSafeQueueBlock(const ThreadSafeQueueBlock &other);/////////////////
-        ThreadSafeQueueBlock(ThreadSafeQueueBlock &&other);/////////////////
-        ThreadSafeQueueBlock &operator=(const ThreadSafeQueueBlock &other);/////////////////
-        ThreadSafeQueueBlock &operator=(ThreadSafeQueueBlock &&other);/////////////////
-        
-        ~ThreadSafeQueueBlock();
+        const size_type checkDequeueAndAdd();
+        const size_type checkEnqueueAndAdd();
 
         size_type capacity() { return _capacity; }
 
@@ -40,15 +39,28 @@ namespace utils {
         template <typename... Args>
 		value_type &emplace(Args&&... args);
 
-        template <typename U> 
-        friend class ThreadSafeQueue;
+        value_type peek();
+        value_type &peek_ref();
+        void pop();
+        value_type pop_get();
+        
+    public: // public methods
+        // ThreadSafeQueueBlock(const ThreadSafeQueueBlock &other);/////////////////
+        // ThreadSafeQueueBlock(ThreadSafeQueueBlock &&other);/////////////////
+        // ThreadSafeQueueBlock &operator=(const ThreadSafeQueueBlock &other);/////////////////
+        // ThreadSafeQueueBlock &operator=(ThreadSafeQueueBlock &&other);/////////////////
+        
+        ~ThreadSafeQueueBlock();
+
+        friend class ThreadSafeQueue<value_type>;
     
     private: // class members
         volatile value_type *_mem_block;
         const size_type _capacity;
-        volatile size_type _size;
+        volatile size_type _enqueue_i;
+        volatile size_type _dequeue_i;
         const bool _delete;
-        volatile ThreadSafeQueueBlock<value_type> _next;
+        volatile ThreadSafeQueueBlock<value_type> _next; // TODO, who deletes _next? xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx
     };
 
     template <typename T>
@@ -66,10 +78,10 @@ utils::ThreadSafeQueueBlock<T> *make_safe_queue_block(typename utils::ThreadSafe
     using obj = utils::ThreadSafeQueueBlock<T>;
     auto objSize = sizeof(obj);
 
-    obj *build = ::operator new (objSize + capacity * sizeof(value_type));
-	new(build) obj(build + objSize, capacity);
+    void *build = ::operator new (objSize + capacity * sizeof(value_type));
+	new(reinterpret_cast<obj *>(build)) obj(reinterpret_cast<value_type *>(build + objSize), capacity);
 
-    return build;
+    return reinterpret_cast<obj *>(build);
 }
 
 template <typename T>
@@ -86,32 +98,68 @@ void delete_safe_queue_block(utils::ThreadSafeQueueBlock<T> *memory) {
 
 template <typename T>
 utils::ThreadSafeQueueBlock<T>::ThreadSafeQueueBlock(value_type *mem_block, size_type capacity)
-: _mem_block(mem_block), _capacity(capacity), _size(0), _delete(false), _next(nullptr) {}
+: _mem_block(mem_block), _capacity(capacity), _enqueue_i(0), _dequeue_i(0), _delete(false), _next(nullptr) {}
 
 template <typename T>
 utils::ThreadSafeQueueBlock<T>::ThreadSafeQueueBlock(size_type capacity)
-: _mem_block((value_type *) ::operator new (capacity * sizeof(value_type))), _capacity(capacity), 
-_size(0), _delete(true), _next(nullptr) {}
+: _mem_block(reinterpret_cast<value_type>(::operator new (capacity * sizeof(value_type)))), _capacity(capacity), 
+_enqueue_i(0), _delete(true), _next(nullptr) {}
 
 
 // public methods:
+/*
+template <typename T>
+typename utils::ThreadSafeQueueBlock<T>::value_type utils::ThreadSafeQueueBlock<T>::peek() {
+    // try to peek, if success then update _dequeue_i, else don't update and throw
+    value_type temp(_mem_block[_dequeue_i]);
+}
+
+template <typename T>
+typename utils::ThreadSafeQueueBlock<T>::value_type &utils::ThreadSafeQueueBlock<T>::peek_ref() {
+    
+}
+*/
+
+template <typename T>
+void utils::ThreadSafeQueueBlock<T>::pop() {
+    // since pop destroys the object, it mustn't let another thread peek/pop the same item,
+    //  so incriment first, then destroy
+
+    const auto place = checkDequeueAndAdd();
+    
+    _mem_block[place].~value_type();
+}
+
+template <typename T>
+typename utils::ThreadSafeQueueBlock<T>::value_type utils::ThreadSafeQueueBlock<T>::pop_get() {
+    // since pop destroys the object, it mustn't let another thread peek/pop the same item,
+    //  so incriment first, then destroy
+
+    const auto place = checkDequeueAndAdd();
+    
+    value_type temp(_mem_block[place]);
+    _mem_block[place].~value_type();
+
+    return temp;
+}
+
 
 template <typename T>
 void utils::ThreadSafeQueueBlock<T>::push(const value_type &item) {
-    auto place = checkAndAdd();
+    const auto place = checkEnqueueAndAdd();
 	new(&_mem_block[place]) value_type(item);
 }
 
 template <typename T>
 void utils::ThreadSafeQueueBlock<T>::push(value_type &&item) {    
-	auto place = checkAndAdd();
+	const auto place = checkEnqueueAndAdd();
     new(&_mem_block[place]) value_type(std::move(item));
 }
 
 template <typename T> 
 template <typename... Args> 
 typename utils::ThreadSafeQueueBlock<T>::value_type &utils::ThreadSafeQueueBlock<T>::emplace(Args &&...args) {
-	auto place = checkAndAdd();
+	const auto place = checkEnqueueAndAdd();
     new(&_mem_block[place]) value_type(std::forward<Args>(args)...);
 
 	return _mem_block[place];
@@ -121,24 +169,42 @@ typename utils::ThreadSafeQueueBlock<T>::value_type &utils::ThreadSafeQueueBlock
 // private methods:
 
 template <typename T>
-typename utils::ThreadSafeQueueBlock<T>::size_type utils::ThreadSafeQueueBlock<T>::checkAndAdd() {
-    // no thread will be able to touch _mem_block[place], since you can only push back
-    auto place = __atomic_fetch_add(&_size, 1, __ATOMIC_RELAXED);
+const typename utils::ThreadSafeQueueBlock<T>::size_type utils::ThreadSafeQueueBlock<T>::checkDequeueAndAdd() {
+    auto dequeueI = __atomic_load_n(&_dequeue_i, __ATOMIC_RELAXED);
+    
+    if (dequeueI >= __atomic_load_n(&_enqueue_i, __ATOMIC_RELAXED))
+        throw std::out_of_range();
 
-    if (place == _capacity)
+    if (!__atomic_compare_exchange_n(&_dequeue_i, &dequeueI, dequeueI + 1, false, __ATOMIC_RELAXED, __ATOMIC_RELAXED)) {
+        // a different thread changed _dequeue_i in between, sleep, then try again
+        std::this_thread::sleep_for(std::chrono::milliseconds(2));
+        return checkDequeueAndAdd();
+    }
+
+    return dequeueI;
+}
+
+template <typename T>
+const typename utils::ThreadSafeQueueBlock<T>::size_type utils::ThreadSafeQueueBlock<T>::checkEnqueueAndAdd() {
+    // no thread will be able to touch _mem_block[place], since you can only push back
+    const auto place = __atomic_fetch_add(&_enqueue_i, 1, __ATOMIC_RELAXED);
+
+    if (place >= _capacity)
         throw std::out_of_range();
 
     return place;
 }
 
+
+
 template <typename T>
 void utils::ThreadSafeQueueBlock<T>::clear() {
-	for (size_type i = 0; i < _size; i++)
+	for (size_type i = _dequeue_i; i < _enqueue_i; i++)
 		_mem_block[i].~value_type();
 
-	_size = 0;
+	__atomic_store_n(&_enqueue_i, 0, __ATOMIC_RELAXED);
+	__atomic_store_n(&_dequeue_i, 0, __ATOMIC_RELAXED);
 }
-
 
 // destructor:
 
