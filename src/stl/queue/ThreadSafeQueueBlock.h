@@ -8,6 +8,8 @@
 #include <thread>
 #include <chrono>
 
+#include <cstring> // for std::memcpy
+
 namespace utils {
     
     template <typename T>
@@ -29,6 +31,8 @@ namespace utils {
         ThreadSafeQueueBlock(size_type capacity);
         
         void clear();
+        void checkPeek(value_type *out);
+        value_type &checkPeekRef();
         const size_type checkDequeueAndAdd();
         const size_type checkEnqueueAndAdd();
 
@@ -102,28 +106,36 @@ utils::ThreadSafeQueueBlock<T>::ThreadSafeQueueBlock(value_type *mem_block, size
 
 template <typename T>
 utils::ThreadSafeQueueBlock<T>::ThreadSafeQueueBlock(size_type capacity)
-: _mem_block(reinterpret_cast<value_type>(::operator new (capacity * sizeof(value_type)))), _capacity(capacity), 
+: _mem_block(reinterpret_cast<value_type *>(::operator new (capacity * sizeof(value_type)))), _capacity(capacity), 
 _enqueue_i(0), _delete(true), _next(nullptr) {}
 
 
 // public methods:
-/*
+
 template <typename T>
 typename utils::ThreadSafeQueueBlock<T>::value_type utils::ThreadSafeQueueBlock<T>::peek() {
     // try to peek, if success then update _dequeue_i, else don't update and throw
-    value_type temp(_mem_block[_dequeue_i]);
+    
+    value_type *tempMem = reinterpret_cast<value_type *>(::operator new(sizeof(value_type)));
+
+    checkPeek(tempMem);
+    value_type temp(*tempMem);
+
+    ::operator delete(tempMem, sizeof(value_type));
+
+    return temp;
 }
 
 template <typename T>
 typename utils::ThreadSafeQueueBlock<T>::value_type &utils::ThreadSafeQueueBlock<T>::peek_ref() {
-    
+    return checkPeekRef();
 }
-*/
+
 
 template <typename T>
 void utils::ThreadSafeQueueBlock<T>::pop() {
     // since pop destroys the object, it mustn't let another thread peek/pop the same item,
-    //  so incriment first, then destroy
+    // so incriment first, then destroy
 
     const auto place = checkDequeueAndAdd();
     
@@ -133,7 +145,7 @@ void utils::ThreadSafeQueueBlock<T>::pop() {
 template <typename T>
 typename utils::ThreadSafeQueueBlock<T>::value_type utils::ThreadSafeQueueBlock<T>::pop_get() {
     // since pop destroys the object, it mustn't let another thread peek/pop the same item,
-    //  so incriment first, then destroy
+    // so incriment first, then destroy
 
     const auto place = checkDequeueAndAdd();
     
@@ -167,6 +179,44 @@ typename utils::ThreadSafeQueueBlock<T>::value_type &utils::ThreadSafeQueueBlock
 
 
 // private methods:
+
+template <typename T>
+typename utils::ThreadSafeQueueBlock<T>::value_type &utils::ThreadSafeQueueBlock<T>::checkPeekRef() {
+    // take enqueue before dequeue, so other threads won't be in the middle of enqueue, 
+    // while dequeue check is happening
+    auto enqueueI = __atomic_load_n(&_enqueue_i, __ATOMIC_RELAXED);
+    auto dequeueI = __atomic_load_n(&_dequeue_i, __ATOMIC_RELAXED);
+    
+    if (dequeueI >= enqueueI)
+        throw std::out_of_range();
+
+    if (!__atomic_compare_exchange_n(&_dequeue_i, &dequeueI, dequeueI, false, __ATOMIC_RELAXED, __ATOMIC_RELAXED)) {
+        // a different thread changed _dequeue_i in between, sleep, then try again
+        std::this_thread::sleep_for(std::chrono::milliseconds(2));
+        return checkPeekRef();
+    }
+
+    return &_mem_block[dequeueI];
+}
+
+template <typename T>
+void utils::ThreadSafeQueueBlock<T>::checkPeek(value_type *out) {
+    // take enqueue before dequeue, so other threads won't be in the middle of enqueue, 
+    // while dequeue check is happening
+    auto enqueueI = __atomic_load_n(&_enqueue_i, __ATOMIC_RELAXED);
+    auto dequeueI = __atomic_load_n(&_dequeue_i, __ATOMIC_RELAXED);
+    
+    if (dequeueI >= enqueueI)
+        throw std::out_of_range();
+
+    std::memcpy(out, _mem_block[dequeueI], sizeof(size_type));
+
+    if (!__atomic_compare_exchange_n(&_dequeue_i, &dequeueI, dequeueI, false, __ATOMIC_RELAXED, __ATOMIC_RELAXED)) {
+        // a different thread changed _dequeue_i in between, sleep, then try again
+        std::this_thread::sleep_for(std::chrono::milliseconds(2));
+        checkPeek(out);
+    }
+}
 
 template <typename T>
 const typename utils::ThreadSafeQueueBlock<T>::size_type utils::ThreadSafeQueueBlock<T>::checkDequeueAndAdd() {
