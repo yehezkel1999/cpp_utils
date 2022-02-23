@@ -170,9 +170,12 @@ typename utils::ThreadSafeQueueBlock<T>::value_type &utils::ThreadSafeQueueBlock
 
 template <typename T>
 const typename utils::ThreadSafeQueueBlock<T>::size_type utils::ThreadSafeQueueBlock<T>::checkDequeueAndAdd() {
+    // take enqueue before dequeue, so other threads won't be in the middle of enqueue, 
+    // while dequeue check is happening
+    auto enqueueI = __atomic_load_n(&_enqueue_i, __ATOMIC_RELAXED);
     auto dequeueI = __atomic_load_n(&_dequeue_i, __ATOMIC_RELAXED);
     
-    if (dequeueI >= __atomic_load_n(&_enqueue_i, __ATOMIC_RELAXED))
+    if (dequeueI >= enqueueI)
         throw std::out_of_range();
 
     if (!__atomic_compare_exchange_n(&_dequeue_i, &dequeueI, dequeueI + 1, false, __ATOMIC_RELAXED, __ATOMIC_RELAXED)) {
